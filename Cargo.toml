@@ -1,0 +1,12 @@
+[workspace]
+members = [
+  "src/aws",
+  "src/init",
+  "src/system"
+]
+
+exclude = [
+  "src/nexus-tool"
+]
+
+resolver = "2"

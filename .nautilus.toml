@@ -1,0 +1,8 @@
+[project]
+template = "rust"
+
+[sui]
+network = "testnet"
+package_id = ""
+config_object_id = ""
+cap_object_id = ""
