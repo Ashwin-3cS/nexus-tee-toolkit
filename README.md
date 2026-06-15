@@ -2,7 +2,7 @@
 
 A Rust template for building verifiable [Nexus](https://talus.network) tools that run inside a Trusted Execution Environment (TEE), producing hardware attestations alongside every tool response.
 
-Follows Talus naming conventions (`nexus-sdk`, `nexus-tools`, `nexus-toolkit`) and the same `NexusTool` trait pattern as the standard tools in [nexus-tools](https://github.com/Talus-Network/nexus-tools).
+Follows the same structure as [nautilus-rust](https://github.com/Ashwin-3cS/nautilus-cli) — axum HTTP server, stagex reproducible build, AWS Nitro Enclave attestation via `nautilus-enclave`.
 
 ---
 
@@ -50,7 +50,7 @@ Offchain (Leader — closed source)
 │     → live PCR0 from running enclave                    │
 │  2. Compare live PCR0 with registered_pcr0              │
 │     → mismatch → reject, mark execution failed          │
-│  3. POST /tee/demo with signed headers                  │
+│  3. POST /tee/demo/invoke with signed headers           │
 └────────────────────┬────────────────────────────────────┘
                      │ HTTPS (signed)
                      ▼
@@ -85,16 +85,49 @@ Onchain (Sui Move)
 
 ---
 
+## Repo Structure
+
+```
+nexus-tee-toolkit/
+├── Cargo.toml               ← workspace (aws, init, system)
+├── Containerfile            ← stagex reproducible build → .eif
+├── Makefile                 ← build, run, stop, logs targets
+├── parent_forwarder.sh      ← bridges host TCP:4000 ↔ enclave VSOCK:4000
+├── src/
+│   ├── aws/                 ← NSM entropy + platform init
+│   ├── init/                ← enclave OS boot (mounts, console, entropy)
+│   ├── system/              ← syscall wrappers (mount, insmod, socket)
+│   └── nexus-tool/          ← axum HTTP server (standalone workspace)
+│       ├── Cargo.toml
+│       ├── run.sh           ← socat VSOCK bridge + starts server
+│       └── src/
+│           ├── main.rs      ← router, LogBufferLayer, EnclaveKeyPair init
+│           ├── lib.rs       ← AppState, LogBuffer, EnclaveError
+│           ├── common.rs    ← HTTP handlers + TEE attestation binding
+│           └── walrus/      ← Walrus blob storage integration
+```
+
+---
+
 ## Running Locally
 
-No enclave required. `TEE_MODE=mock` produces structurally correct attestations with a clearly-labelled placeholder PCR0.
+No enclave required. Outside a Nitro enclave, `nautilus-enclave` returns a mock PCR0 (`aaa...`) — the attestation structure is identical, only the hardware signature is absent.
 
 ```bash
-# Start the tool (mock mode)
-docker compose up
+# Start the tool
+cargo run --manifest-path src/nexus-tool/Cargo.toml
 
-# Call the tool
-curl -X POST http://localhost:8080/tee/demo/invoke \
+# Ping
+curl http://localhost:4000/
+
+# Health check (returns ephemeral public key)
+curl http://localhost:4000/health
+
+# Get attestation (PCR0 + ephemeral pubkey)
+curl http://localhost:4000/get_attestation
+
+# Invoke the demo tool
+curl -X POST http://localhost:4000/tee/demo/invoke \
   -H "Content-Type: application/json" \
   -d '{"message": "hello TEE"}'
 ```
@@ -105,27 +138,37 @@ Response:
   "ok": {
     "result": "Processed inside enclave: hello TEE",
     "attestation": {
-      "pcr0": "mock:0000...",
-      "report": "",
+      "pcr0": "aaa...",
+      "raw_cbor_hex": "...",
       "tool_fqn": "xyz.ashwin.tee.demo@1",
       "input_hash": "sha256:...",
       "output_hash": "sha256:...",
-      "timestamp": "2026-06-15T10:00:00Z",
-      "tee_type": "mock"
+      "timestamp": "2026-06-15T10:00:00Z"
     }
   }
 }
 ```
 
-```bash
-# Check live PCR0 (what the Leader would call before invoking)
-curl http://localhost:8081/attestation
-```
+### Walrus Storage (live testnet)
 
 ```bash
-# Verify an attestation document offline
-cargo run --bin verify -- attestation.json
-cargo run --bin verify -- attestation.json --pcr0 mock:0000...
+# Upload JSON — returns blob_id + TEE attestation
+curl -X POST http://localhost:4000/walrus/upload-json \
+  -H "Content-Type: application/json" \
+  -d '{"json": "{\"key\": \"value\"}", "epochs": 1}'
+
+# Read back
+curl -X POST http://localhost:4000/walrus/read-json \
+  -H "Content-Type: application/json" \
+  -d '{"blob_id": "<blob_id from above>"}'
+
+# Verify blob availability
+curl -X POST http://localhost:4000/walrus/verify-blob \
+  -H "Content-Type: application/json" \
+  -d '{"blob_id": "<blob_id>"}'
+
+# View recent enclave logs
+curl http://localhost:4000/logs
 ```
 
 ---
@@ -133,26 +176,26 @@ cargo run --bin verify -- attestation.json --pcr0 mock:0000...
 ## Running in a Real Nitro Enclave
 
 ```bash
-# Build the enclave image
-docker build -f enclave/Dockerfile -t tee-demo:enclave .
-
-# Convert to EIF (on an EC2 instance with nitro-cli)
-nitro-cli build-enclave \
-  --docker-uri tee-demo:enclave \
-  --output-file tee-demo.eif
+# Build the enclave image file (requires nitro-cli on EC2)
+make
 
 # The PCR0 printed here is what you register onchain.
 # nitro-cli output: PCR0 = sha384:<hex>
 
 # Run the enclave
-nitro-cli run-enclave \
-  --eif-path tee-demo.eif \
-  --memory 512 \
-  --cpu-count 2 \
-  --enclave-cid 16
+make run
 
-# Set TEE_MODE=nitro in the enclave environment for real attestations.
+# Forward traffic from host to enclave VSOCK
+./parent_forwarder.sh
+
+# Tail enclave logs
+make logs
+
+# Stop
+make stop
 ```
+
+Inside the enclave, `nautilus-enclave` calls `/dev/nsm` directly — the PCR0 in every attestation response is the real SHA-384 of the running enclave binary.
 
 ---
 
@@ -172,27 +215,6 @@ This toolkit proposes extending it to:
 - `tee_type`: `"nitro"` (AWS Nitro Enclaves) or `"tdx"` (Intel TDX).
 
 This is a Move contract change — Nexus Maintainer territory. The toolkit is the proof-of-concept that makes the case for this extension.
-
----
-
-## Repo Structure
-
-```
-nexus-tee-toolkit/
-├── Cargo.toml               ← workspace
-├── Dockerfile               ← dev-mode (TEE_MODE=mock)
-├── docker-compose.yml       ← docker compose up → :8080/:8081
-├── enclave/
-│   └── Dockerfile           ← real Nitro enclave image
-└── tool/
-    ├── Cargo.toml
-    ├── build.rs             ← same TOOL_FQN_VERSION pattern as nexus-tools
-    ├── tools.json           ← tee: { enabled: true, type: "nitro" }
-    └── src/
-        ├── main.rs          ← NexusTool impl + /attestation sidecar
-        ├── attestation.rs   ← attestation generation (mock + nitro)
-        └── verify.rs        ← standalone verifier CLI
-```
 
 ---
 
